@@ -7,9 +7,89 @@ and RGB channels are normalized to ``[0, 1]``.  The tests compare floats
 with an absolute tolerance of ``1e-6``.
 """
 
+import math
+from collections.abc import Mapping
+
+EPS = 1e-6
+CENTER = (0.5, 0.5)
+
 
 class FlareError(Exception):
     """Raised when flare input is malformed or cannot be rendered."""
+
+
+def _finite_number(value):
+    """Return ``True`` for a finite real number (booleans excluded)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _pair(value):
+    """Return ``(u, v)`` as floats, or ``None`` when malformed."""
+    if isinstance(value, (str, bytes)):
+        return None
+    try:
+        u, v = value
+    except (TypeError, ValueError):
+        return None
+    if not (_finite_number(u) and _finite_number(v)):
+        return None
+    return float(u), float(v)
+
+
+def _uv_in_range(uv):
+    """Return the clamped UV when both components lie in ``[0, 1]`` +/- EPS."""
+    pair = _pair(uv)
+    if pair is None:
+        return None
+    if not all(-EPS <= component <= 1.0 + EPS for component in pair):
+        return None
+    return (
+        min(max(pair[0], 0.0), 1.0),
+        min(max(pair[1], 0.0), 1.0),
+    )
+
+
+def _positive_int(value):
+    """Return ``True`` for an integer greater than zero (booleans excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _validate_depth_map(depth_map):
+    """Return the depth map as rows of floats or raise ``FlareError``."""
+    if isinstance(depth_map, (str, bytes)):
+        raise FlareError("depth_map must be a non-empty rectangular sequence")
+    try:
+        rows = list(depth_map)
+    except TypeError:
+        raise FlareError("depth_map must be a non-empty rectangular sequence")
+    if not rows:
+        raise FlareError("depth_map must be non-empty")
+    width = None
+    parsed = []
+    for row in rows:
+        if isinstance(row, (str, bytes)):
+            raise FlareError("depth_map must be a non-empty rectangular sequence")
+        try:
+            cells = list(row)
+        except TypeError:
+            raise FlareError("depth_map must be a non-empty rectangular sequence")
+        if width is None:
+            width = len(cells)
+            if width == 0:
+                raise FlareError("depth_map rows must be non-empty")
+        elif len(cells) != width:
+            raise FlareError("depth_map must be rectangular")
+        parsed_row = []
+        for cell in cells:
+            if not _finite_number(cell):
+                raise FlareError("depth_map cells must be finite numbers")
+            parsed_row.append(float(cell))
+        parsed.append(parsed_row)
+    return parsed
 
 
 def ghost_positions(uv, count, spread):
@@ -39,7 +119,33 @@ def ghost_positions(uv, count, spread):
         FlareError: If ``uv`` is malformed or outside ``[0, 1]``,
             ``count <= 0``, or ``spread < 0``.
     """
-    raise NotImplementedError("ghost_positions is not implemented")
+    source = _uv_in_range(uv)
+    if source is None:
+        raise FlareError("uv out of range")
+    if not _positive_int(count):
+        raise FlareError("count must be a positive integer")
+    if not _finite_number(spread) or spread < 0.0:
+        raise FlareError("spread must be non-negative")
+
+    center_u, center_v = CENTER
+    du = source[0] - center_u
+    dv = source[1] - center_v
+
+    ghosts = []
+    for index in range(count):
+        if count == 1:
+            t = 0.0
+        else:
+            t = -spread + 2.0 * spread * index / (count - 1)
+        u = center_u + t * du
+        v = center_v + t * dv
+        if not (-EPS <= u <= 1.0 + EPS and -EPS <= v <= 1.0 + EPS):
+            continue
+        ghosts.append((
+            min(max(round(u, 10), 0.0), 1.0),
+            min(max(round(v, 10), 0.0), 1.0),
+        ))
+    return ghosts
 
 
 def visible_source(uv, depth_map):
@@ -67,7 +173,17 @@ def visible_source(uv, depth_map):
         FlareError: If ``uv`` is outside ``[0, 1]`` or ``depth_map`` is
             empty or ragged.
     """
-    raise NotImplementedError("visible_source is not implemented")
+    source = _uv_in_range(uv)
+    if source is None:
+        raise FlareError("uv out of range")
+    rows = _validate_depth_map(depth_map)
+
+    height = len(rows)
+    width = len(rows[0])
+    u, v = source
+    column = min(int(u * width), width - 1)
+    row = min(int(v * height), height - 1)
+    return abs(rows[row][column]) <= EPS
 
 
 def chroma_split(rgb, amount):
@@ -90,7 +206,23 @@ def chroma_split(rgb, amount):
         FlareError: If ``rgb`` is not three finite values in ``[0, 1]``,
             or ``amount`` is outside ``[0, 1]``.
     """
-    raise NotImplementedError("chroma_split is not implemented")
+    if isinstance(rgb, (str, bytes)):
+        raise FlareError("rgb must be three channels in [0, 1]")
+    try:
+        channels = list(rgb)
+    except TypeError:
+        raise FlareError("rgb must be three channels in [0, 1]")
+    if len(channels) != 3 or not all(
+        _finite_number(channel) and 0.0 <= channel <= 1.0 for channel in channels
+    ):
+        raise FlareError("rgb must be three channels in [0, 1]")
+    if not _finite_number(amount) or not 0.0 <= amount <= 1.0:
+        raise FlareError("amount must be in [0, 1]")
+
+    red, green, blue = (float(channel) for channel in channels)
+    red = min(max(red + amount, 0.0), 1.0)
+    blue = min(max(blue - amount, 0.0), 1.0)
+    return (red, green, blue)
 
 
 def aperture_mask(uv, blades):
@@ -115,7 +247,42 @@ def aperture_mask(uv, blades):
         FlareError: If ``blades`` is not an integer greater than or equal
             to 3.
     """
-    raise NotImplementedError("aperture_mask is not implemented")
+    if (
+        not isinstance(blades, int)
+        or isinstance(blades, bool)
+        or blades < 3
+    ):
+        raise FlareError("blades must be an integer >= 3")
+    point = _pair(uv)
+    if point is None:
+        raise FlareError("uv must be a finite pair")
+
+    center_u, center_v = CENTER
+    radius = 0.5
+    vertices = []
+    for index in range(blades):
+        angle = 2.0 * math.pi * index / blades
+        vertices.append(
+            (
+                center_u + radius * math.cos(angle),
+                center_v + radius * math.sin(angle),
+            )
+        )
+
+    inside = True
+    for index in range(blades):
+        au, av = vertices[index]
+        bu, bv = vertices[(index + 1) % blades]
+        edge_u = bu - au
+        edge_v = bv - av
+        rel_u = point[0] - au
+        rel_v = point[1] - av
+        cross = edge_u * rel_v - edge_v * rel_u
+        if cross < -1e-9:
+            inside = False
+            break
+
+    return 1.0 if inside else 0.0
 
 
 def halo_position(uv, center):
@@ -133,7 +300,14 @@ def halo_position(uv, center):
     Returns:
         The reflected ``(u, v)`` tuple.
     """
-    raise NotImplementedError("halo_position is not implemented")
+    source = _pair(uv)
+    pivot = _pair(center)
+    if source is None or pivot is None:
+        raise FlareError("uv and center must be finite pairs")
+    return (
+        2.0 * pivot[0] - source[0],
+        2.0 * pivot[1] - source[1],
+    )
 
 
 def falloff(dist, radius, power):
@@ -155,7 +329,15 @@ def falloff(dist, radius, power):
     Raises:
         FlareError: If ``dist < 0``, ``radius <= 0``, or ``power <= 0``.
     """
-    raise NotImplementedError("falloff is not implemented")
+    if not _finite_number(dist) or dist < 0.0:
+        raise FlareError("dist must be non-negative")
+    if not _finite_number(radius) or radius <= 0.0:
+        raise FlareError("radius must be positive")
+    if not _finite_number(power) or power <= 0.0:
+        raise FlareError("power must be positive")
+    if dist >= radius:
+        return 0.0
+    return (1.0 - dist / radius) ** power
 
 
 def validate(uv, count, intensity):
@@ -181,7 +363,69 @@ def validate(uv, count, intensity):
     Returns:
         A list containing zero to three problem strings.
     """
-    raise NotImplementedError("validate is not implemented")
+    problems = []
+    if _uv_in_range(uv) is None:
+        problems.append("uv out of range")
+    if not _positive_int(count):
+        problems.append("count must be a positive integer")
+    if (
+        not _finite_number(intensity)
+        or not -EPS <= intensity <= 1.0 + EPS
+    ):
+        problems.append("intensity out of range")
+    return problems
+
+
+def _validated_config(config):
+    """Validate the batch config and return the fields the batch needs."""
+    if not isinstance(config, Mapping):
+        raise FlareError("config must be a mapping")
+
+    required = (
+        "count",
+        "spread",
+        "blades",
+        "power",
+        "radius",
+        "rgb",
+        "amount",
+        "depth_map",
+    )
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise FlareError("config is missing: " + ", ".join(missing))
+
+    count = config["count"]
+    spread = config["spread"]
+    blades = config["blades"]
+    power = config["power"]
+    radius = config["radius"]
+
+    if not _positive_int(count):
+        raise FlareError("count must be a positive integer")
+    if not _finite_number(spread) or spread < 0.0:
+        raise FlareError("spread must be non-negative")
+    if not isinstance(blades, int) or isinstance(blades, bool) or blades < 3:
+        raise FlareError("blades must be an integer >= 3")
+    if not _finite_number(power) or power <= 0.0:
+        raise FlareError("power must be positive")
+    if not _finite_number(radius) or radius <= 0.0:
+        raise FlareError("radius must be positive")
+
+    # Validate rgb/amount eagerly so a malformed config is rejected even
+    # for an empty source list.
+    chroma_split(config["rgb"], config["amount"])
+
+    return {
+        "count": count,
+        "spread": float(spread),
+        "blades": blades,
+        "power": float(power),
+        "radius": float(radius),
+        "rgb": tuple(float(channel) for channel in config["rgb"]),
+        "amount": float(config["amount"]),
+        "depth_map": _validate_depth_map(config["depth_map"]),
+    }
 
 
 def flare_batch(sources, config):
@@ -229,4 +473,65 @@ def flare_batch(sources, config):
     Raises:
         FlareError: If the config or any source is invalid.
     """
-    raise NotImplementedError("flare_batch is not implemented")
+    options = _validated_config(config)
+
+    if isinstance(sources, (str, bytes)):
+        raise FlareError("sources must be a sequence of mappings")
+    try:
+        entries = list(sources)
+    except TypeError:
+        raise FlareError("sources must be a sequence of mappings")
+
+    # Validate every source before producing any record.
+    prepared = []
+    for index, source in enumerate(entries):
+        if not isinstance(source, Mapping):
+            raise FlareError("source %d must be a mapping" % index)
+        if "uv" not in source or "intensity" not in source:
+            raise FlareError("source %d needs uv and intensity" % index)
+        uv = source["uv"]
+        intensity = source["intensity"]
+        problems = validate(uv, options["count"], intensity)
+        if problems:
+            raise FlareError(
+                "source %d: %s" % (index, "; ".join(problems))
+            )
+        prepared.append((_uv_in_range(uv), float(intensity)))
+
+    count = options["count"]
+    spread = options["spread"]
+    blades = options["blades"]
+    power = options["power"]
+    radius = options["radius"]
+    rgb = options["rgb"]
+    amount = options["amount"]
+    depth_map = options["depth_map"]
+
+    result = {}
+    center_u, center_v = CENTER
+    for index, (uv, intensity) in enumerate(prepared):
+        u, v = float(uv[0]), float(uv[1])
+
+        # Each source gets its own fresh ghost list.
+        ghosts = ghost_positions((u, v), count, spread)
+        ghost_weights = [intensity for _ in ghosts]
+
+        halo = halo_position((u, v), CENTER)
+        chroma = chroma_split(rgb, amount)
+        aperture = aperture_mask((u, v), blades)
+        distance = math.hypot(u - center_u, v - center_v)
+        radial = falloff(distance, radius, power)
+
+        result[index] = {
+            "uv": (u, v),
+            "intensity": intensity,
+            "ghosts": ghosts,
+            "ghost_weights": ghost_weights,
+            "visible": visible_source((u, v), depth_map),
+            "halo": halo,
+            "halo_weight": intensity,
+            "chroma": tuple(channel * intensity for channel in chroma),
+            "aperture": aperture * intensity,
+            "falloff": radial * intensity,
+        }
+    return result
